@@ -1,0 +1,10 @@
+[Unit]
+Description=Apagado automático de Raspberry por AutoShutdown
+After=minecraft-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mc-poweroff.sh
+
+[Install]
+WantedBy=multi-user.target

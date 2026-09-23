@@ -1,0 +1,17 @@
+# Hora (0-23) a partir de la cual empieza a vigilar si el servidor está vacío
+start-hour: 2
+
+# Hora (0-23) a la cual deja de vigilar
+end-hour: 7
+
+# Cada cuántos minutos revisa si hay jugadores conectados
+check-interval-minutes: 10
+
+# Cuántas revisiones seguidas debe estar vacío antes de empezar la cuenta regresiva
+# (evita apagar por una desconexión momentánea)
+empty-checks-required: 2
+
+# Minutos de "gracia" ANTES de apagar de verdad, una vez que se cumplió lo de arriba.
+# Si en ese tiempo entra algún jugador, el apagado se cancela automáticamente.
+# Pon 0 si quieres que apague de inmediato sin esperar.
+grace-period-minutes: 5
