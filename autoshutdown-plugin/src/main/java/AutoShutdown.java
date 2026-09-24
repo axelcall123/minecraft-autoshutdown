@@ -4,39 +4,41 @@ import org.bukkit.Bukkit;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.temporal.ChronoUnit;
 import java.util.logging.Level;
 
 /**
- * AutoShutdown
- * - A partir de "start-hour", revisa cada "check-interval-minutes" si hay jugadores online.
- * - Si el servidor está vacío durante "empty-checks-required" revisiones seguidas,
- *   entra en "cuenta regresiva" de "grace-period-minutes" antes de apagar de verdad.
- * - Si durante esa cuenta regresiva entra un jugador, el apagado se cancela solo.
- * - Al cumplirse la cuenta regresiva sin jugadores, crea un flag file y llama a
- *   Bukkit.shutdown() (apagado limpio, guarda mundos).
- * - El flag file lo lee luego un script externo (ExecStopPost de systemd) para decidir
- *   si apaga también la máquina física.
+ * AutoShutdown (event-driven)
+ * - Ya NO hace polling cada N minutos. En vez de eso:
+ *   1) Cuando un jugador se desconecta (PlayerQuitEvent), revisa 1 tick después
+ *      si el servidor quedó vacío y si estamos dentro de la ventana horaria
+ *      [start-hour, end-hour). Si sí, arranca la cuenta regresiva de apagado.
+ *   2) Si un jugador entra (PlayerJoinEvent) durante la cuenta regresiva, se cancela.
+ *   3) Una única tarea que se reprograma sola para dispararse exactamente a
+ *      "start-hour" cada día, para cubrir el caso borde en que el servidor
+ *      YA estaba vacío antes de que empezara la ventana (ahí no hay ningún
+ *      evento de quit que dispare la revisión).
  *
- * Todo el chequeo vive dentro de la JVM del propio servidor: no hay ningún proceso
- * externo haciendo polling constante, por lo que el costo extra es prácticamente cero.
+ * Resultado: cero sondeo periódico redundante, todo reacciona a eventos reales
+ * o a un único disparo diario calculado con delay exacto.
  */
 public class AutoShutdown extends JavaPlugin implements Listener {
 
-    private BukkitTask checkTask;
     private BukkitTask pendingShutdownTask;
+    private BukkitTask dailyWindowCheckTask;
 
     private int startHour;
-    private int intervalMinutes;
-    private int emptyChecksRequired;
+    private int endHour;
     private int gracePeriodMinutes;
 
-    private int emptyStreak = 0;
     private boolean shutdownScheduled = false;
     private File flagFile;
 
@@ -46,8 +48,7 @@ public class AutoShutdown extends JavaPlugin implements Listener {
         reloadConfig();
 
         startHour = getConfig().getInt("start-hour", 3);
-        intervalMinutes = Math.max(1, getConfig().getInt("check-interval-minutes", 10));
-        emptyChecksRequired = Math.max(1, getConfig().getInt("empty-checks-required", 2));
+        endHour = getConfig().getInt("end-hour", 7);
         gracePeriodMinutes = Math.max(0, getConfig().getInt("grace-period-minutes", 5));
 
         flagFile = new File(getDataFolder(), "shutdown.flag");
@@ -58,18 +59,17 @@ public class AutoShutdown extends JavaPlugin implements Listener {
 
         Bukkit.getPluginManager().registerEvents(this, this);
 
-        long periodTicks = intervalMinutes * 60L * 20L; // minutos -> ticks (20 ticks/seg)
-        checkTask = Bukkit.getScheduler().runTaskTimer(this, this::checkAndMaybeSchedule, periodTicks, periodTicks);
+        scheduleDailyWindowCheck();
 
-        getLogger().info("AutoShutdown activo: desde las " + startHour + ":00, revisando cada "
-                + intervalMinutes + " min, apaga tras " + emptyChecksRequired
-                + " revisiones vacías + " + gracePeriodMinutes + " min de gracia.");
+        getLogger().info("AutoShutdown activo (event-driven): ventana " + startHour + ":00-"
+                + endHour + ":00, apaga tras " + gracePeriodMinutes
+                + " min de gracia sin jugadores.");
     }
 
     @Override
     public void onDisable() {
-        if (checkTask != null) {
-            checkTask.cancel();
+        if (dailyWindowCheckTask != null) {
+            dailyWindowCheckTask.cancel();
         }
         if (pendingShutdownTask != null) {
             pendingShutdownTask.cancel();
@@ -81,35 +81,59 @@ public class AutoShutdown extends JavaPlugin implements Listener {
      */
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        emptyStreak = 0;
         if (shutdownScheduled) {
             cancelPendingShutdown();
             getLogger().info("Apagado cancelado: " + event.getPlayer().getName() + " se conectó.");
         }
     }
 
-    private void checkAndMaybeSchedule() {
+    /**
+     * Revisa al desconectarse un jugador si el servidor quedó vacío.
+     * Se agenda 1 tick después porque durante el propio evento a veces el
+     * jugador que se va todavía cuenta en getOnlinePlayers() dependiendo
+     * del server/version.
+     */
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        Bukkit.getScheduler().runTask(this, this::checkIfShouldSchedule);
+    }
+
+    /**
+     * Disparo único que se reprograma solo para la próxima "start-hour".
+     * Cubre el caso borde: servidor ya vacío cuando empieza la ventana.
+     */
+    private void scheduleDailyWindowCheck() {
+        long delayTicks = ticksUntilNext(startHour);
+        dailyWindowCheckTask = Bukkit.getScheduler().runTaskLater(this, () -> {
+            checkIfShouldSchedule();
+            scheduleDailyWindowCheck(); // reprograma para el día siguiente
+        }, delayTicks);
+    }
+
+    private long ticksUntilNext(int hour) {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime next = now.withHour(hour).withMinute(0).withSecond(0).withNano(0);
+        if (!next.isAfter(now)) {
+            next = next.plusDays(1);
+        }
+        long seconds = ChronoUnit.SECONDS.between(now, next);
+        return seconds * 20L; // segundos -> ticks
+    }
+
+    private void checkIfShouldSchedule() {
         int hourNow = LocalTime.now().getHour();
 
         if (!isWithinWindow(hourNow)) {
-            emptyStreak = 0;
             return;
         }
 
         if (shutdownScheduled) {
-            // Ya está en cuenta regresiva, no hace falta seguir contando revisiones.
+            // Ya está en cuenta regresiva, no hace falta hacer nada más.
             return;
         }
 
         if (Bukkit.getOnlinePlayers().isEmpty()) {
-            emptyStreak++;
-            getLogger().info("Servidor vacío (" + emptyStreak + "/" + emptyChecksRequired + ").");
-
-            if (emptyStreak >= emptyChecksRequired) {
-                scheduleShutdown();
-            }
-        } else {
-            emptyStreak = 0;
+            scheduleShutdown();
         }
     }
 
@@ -144,7 +168,6 @@ public class AutoShutdown extends JavaPlugin implements Listener {
 
     private void cancelPendingShutdown() {
         shutdownScheduled = false;
-        emptyStreak = 0;
         if (pendingShutdownTask != null) {
             pendingShutdownTask.cancel();
             pendingShutdownTask = null;
@@ -158,28 +181,16 @@ public class AutoShutdown extends JavaPlugin implements Listener {
     }
 
     /**
-     * Ventana simple: cualquier hora >= start-hour (mismo día).
-     * Si prefieres una ventana nocturna cíclica (ej. 23:00 a 07:00), reemplaza por:
-     *
-     *   int endHour = getConfig().getInt("end-hour", 7);
-     *   if (startHour <= endHour) {
-     *       return hourNow >= startHour && hourNow < endHour;
-     *   } else {
-     *       return hourNow >= startHour || hourNow < endHour;
-     *   }
+     * Ventana horaria: soporta tanto rango normal (2 -> 7) como rango
+     * que cruza medianoche (23 -> 7).
      */
     private boolean isWithinWindow(int hourNow) {
-        int endHour = getConfig().getInt("end-hour", 7);
-
         if (startHour <= endHour) {
-            // ventana normal (ej. 2 → 7)
             return hourNow >= startHour && hourNow < endHour;
         } else {
-            // ventana que cruza medianoche (ej. 23 → 7)
             return hourNow >= startHour || hourNow < endHour;
         }
     }
-
 
     private void writeFlag() {
         try {
