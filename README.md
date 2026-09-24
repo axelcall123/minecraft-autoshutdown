@@ -105,7 +105,7 @@ Description=Timer nocturno para mc-poweroff
 
 [Timer]
 # Corre cada 5 minutos entre las 00:00 y las 02:59
-OnCalendar=*-*-* 00..04:*:00/5
+OnCalendar=*-*-* 00..04:00/5:00
 
 [Install]
 WantedBy=timers.target
